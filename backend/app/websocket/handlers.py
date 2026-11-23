@@ -1,3 +1,4 @@
+import os
 import logging
 import time
 from typing import Dict, Any
@@ -7,23 +8,85 @@ from app.websocket.events import WSEvent
 from app.database.connection import AsyncSessionLocal
 from app.services.code_service import CodeService
 from app.services.version_service import VersionService
+from app.services.project_service import ProjectService
 from app.core.security import decode_access_token
 
 logger = logging.getLogger("codecanvas.websocket.handler")
 
+# WebSocket close codes (4000-4999 are application-defined)
+WS_CLOSE_UNAUTHENTICATED = 4001
+WS_CLOSE_FORBIDDEN = 4003
+
 
 async def handle_websocket_connection(websocket: WebSocket, project_id: str, token: str = None):
-    # Authenticate user from token if provided, or assign guest collaborator identity
-    user_id = "guest-" + str(int(time.time() * 1000))[-6:]
-    user_name = "Collaborator"
+    """
+    WebSocket connection handler with authentication and authorization.
+
+    Authentication:
+    - In development mode (ENVIRONMENT=development), a missing token falls back
+      to the default dev user identity so local testing requires no login.
+    - In all other environments (production, test), a valid JWT token is required.
+
+    Authorization:
+    - The authenticated user must own or have collaborator access to the project.
+    - Write operations (code.update, element.update, project.save) are only
+      permitted to users who passed the initial authorization check.
+    """
+    environment = (os.getenv("ENVIRONMENT") or settings.ENVIRONMENT or "development").lower()
+
+    # ── Step 1: Resolve user identity from token ──────────────────────────────
+    user_id = None
+    user_name = "Developer"
+    user_email = ""
 
     if token:
         payload = decode_access_token(token)
         if payload and "sub" in payload:
             user_id = payload["sub"]
-            user_name = payload.get("email", "Developer").split("@")[0].capitalize()
+            user_email = payload.get("email", "")
+            user_name = user_email.split("@")[0].capitalize() if user_email else "Developer"
 
-    # Deterministic nice color based on user_id
+    # If no token resolved a user, check if we can use the dev fallback
+    if not user_id:
+        if environment == "development":
+            # Use default developer identity in local dev mode
+            user_id = "00000000-0000-0000-0000-000000000001"
+            user_name = "Developer"
+        else:
+            # Reject unauthenticated connections in production/test
+            await websocket.accept()
+            await websocket.send_json({
+                "event": WSEvent.ERROR,
+                "data": {"message": "Authentication required. Provide a valid token."},
+                "timestamp": time.time()
+            })
+            await websocket.close(code=WS_CLOSE_UNAUTHENTICATED)
+            return
+
+    # ── Step 2: Verify project access & roles ─────────────────────────────────
+    can_write = False
+    is_owner = False
+    try:
+        async with AsyncSessionLocal() as db:
+            project = await ProjectService.get_project_by_id(db, project_id, user_id)
+            is_owner = (project.owner_id == user_id)
+            if is_owner:
+                can_write = True
+            else:
+                collab = next((c for c in project.collaborators if c.user_id == user_id), None)
+                if collab and collab.role in ("owner", "editor"):
+                    can_write = True
+    except Exception as exc:
+        await websocket.accept()
+        await websocket.send_json({
+            "event": WSEvent.ERROR,
+            "data": {"message": "Project not found or access denied."},
+            "timestamp": time.time()
+        })
+        await websocket.close(code=WS_CLOSE_FORBIDDEN)
+        return
+
+    # ── Step 3: Accept the connection ─────────────────────────────────────────
     colors = ["#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#ec4899", "#06b6d4"]
     user_color = colors[hash(user_id) % len(colors)]
 
@@ -31,6 +94,8 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
         "userId": user_id,
         "userName": user_name,
         "userColor": user_color,
+        "isOwner": is_owner,
+        "canWrite": can_write,
         "joinedAt": time.time()
     }
 
@@ -60,6 +125,7 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
         "timestamp": time.time()
     })
 
+    # ── Step 4: Message loop ──────────────────────────────────────────────────
     try:
         while True:
             raw_data = await websocket.receive_text()
@@ -73,8 +139,26 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
                 })
                 continue
 
+            if not isinstance(message, dict):
+                await ws_manager.send_personal(websocket, {
+                    "event": WSEvent.ERROR,
+                    "data": {"message": "Message must be a JSON object"}
+                })
+                continue
+
             event_type = message.get("event")
             payload = message.get("data", {})
+            if not isinstance(payload, dict):
+                payload = {}
+
+            # ── Write events require write permission (owner or editor) ───────
+            WRITE_EVENTS = {WSEvent.CODE_UPDATE, WSEvent.ELEMENT_UPDATE, WSEvent.PROJECT_SAVE}
+            if event_type in WRITE_EVENTS and not can_write:
+                await ws_manager.send_personal(websocket, {
+                    "event": WSEvent.ERROR,
+                    "data": {"message": "You do not have write access to this project. Your role is view-only."}
+                })
+                continue
 
             if event_type == WSEvent.CODE_UPDATE:
                 filename = payload.get("filename")
@@ -86,7 +170,6 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
                         except Exception as e:
                             logger.error(f"Error persisting code update: {e}")
 
-                    # Broadcast to other clients
                     await ws_manager.broadcast_to_room(
                         project_id,
                         {
@@ -120,7 +203,6 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
                                 styles=styles,
                                 attributes=attributes
                             )
-                            # Broadcast to all clients including sender or excluding
                             await ws_manager.broadcast_to_room(
                                 project_id,
                                 {
@@ -163,11 +245,7 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
                     {
                         "event": WSEvent.CURSOR_MOVED,
                         "projectId": project_id,
-                        "data": {
-                            "x": x,
-                            "y": y,
-                            "user": user_info
-                        },
+                        "data": {"x": x, "y": y, "user": user_info},
                         "timestamp": time.time()
                     },
                     exclude=websocket
@@ -180,7 +258,6 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
                         version = await VersionService.create_version(
                             db, project_id, user_id=user_id, title=title
                         )
-                        # Notify all clients that project was saved
                         await ws_manager.broadcast_to_room(
                             project_id,
                             {
@@ -196,6 +273,10 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
                         )
                     except Exception as e:
                         logger.error(f"Error creating project save version: {e}")
+
+            else:
+                # Unknown event — silently ignore to avoid breaking clients
+                logger.debug(f"Unknown WS event '{event_type}' from user {user_id}")
 
     except WebSocketDisconnect:
         disconnected_user = await ws_manager.disconnect(websocket, project_id)

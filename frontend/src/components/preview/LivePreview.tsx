@@ -39,9 +39,10 @@ export const LivePreview: React.FC<LivePreviewProps> = ({
     }
   };
 
-  // Preview URL with previewKey for forced cache-busting refresh
+  // Preview URL with previewKey for forced cache-busting refresh, plus auth token if present
+  const storedToken = typeof localStorage !== 'undefined' ? localStorage.getItem('token') : null;
   const previewUrl = currentProject
-    ? `/api/v1/projects/${currentProject.id}/preview?v=${previewKey}`
+    ? `/api/v1/projects/${currentProject.id}/preview?v=${previewKey}${storedToken ? `&token=${encodeURIComponent(storedToken)}` : ''}`
     : '';
 
   useEffect(() => {
@@ -51,8 +52,23 @@ export const LivePreview: React.FC<LivePreviewProps> = ({
   // Handle messages from the injected CodeCanvas Bridge inside preview iframe
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
+      // 1. Source verification: MUST originate strictly from our preview iframe's contentWindow.
+      // Checking event.origin === 'null' is NEVER enough on its own because any arbitrary
+      // sandboxed frame across the internet can have an opaque origin of 'null'.
+      if (!iframeRef.current || !iframeRef.current.contentWindow) return;
+      if (event.source !== iframeRef.current.contentWindow) return;
+
+      // 2. Origin verification: sandboxed iframe has opaque origin ('null'). In same-origin,
+      // it may report window.location.origin. Reject all other origins.
+      if (event.origin !== 'null' && event.origin !== window.location.origin) return;
+
       const data = event.data;
-      if (!data || data.source !== 'codecanvas-preview') return;
+      if (!data || typeof data !== 'object') return;
+      if (data.source !== 'codecanvas-preview') return;
+      if (typeof data.type !== 'string') return;
+
+      // 3. Project isolation check: verify message belongs to the currently active project
+      if (data.projectId && currentProject && data.projectId !== currentProject.id) return;
 
       switch (data.type) {
         case 'preview-ready':
@@ -67,40 +83,52 @@ export const LivePreview: React.FC<LivePreviewProps> = ({
           break;
 
         case 'element-selected':
-          setSelectedElement(data.payload);
-          if (onElementSelect && data.payload?.elementId) {
-            onElementSelect(data.payload.elementId);
+          if (data.payload && typeof data.payload === 'object' && typeof data.payload.elementId === 'string') {
+            setSelectedElement(data.payload);
+            if (onElementSelect) {
+              onElementSelect(data.payload.elementId);
+            }
           }
           break;
 
         case 'text-edited':
-          if (data.payload?.elementId && data.payload?.newText !== undefined) {
+          // Validate payload schema and types before applying
+          if (
+            data.payload &&
+            typeof data.payload.elementId === 'string' &&
+            typeof data.payload.newText === 'string'
+          ) {
             applyTextChange(data.payload.newText);
           }
           break;
 
         case 'dom-tree-response':
-          if (data.payload?.tree) {
+          if (data.payload?.tree && typeof data.payload.tree === 'object') {
             setDomTree(data.payload.tree);
           }
           break;
 
         case 'console-log':
-          addConsoleLog({
-            level: data.payload.level || 'info',
-            message: data.payload.message || '',
-            timestamp: data.payload.timestamp || Date.now(),
-          });
+          if (data.payload && typeof data.payload === 'object') {
+            const level = ['info', 'warn', 'error', 'log'].includes(data.payload.level) ? data.payload.level : 'info';
+            addConsoleLog({
+              level,
+              message: String(data.payload.message || '').slice(0, 1000),
+              timestamp: typeof data.payload.timestamp === 'number' ? data.payload.timestamp : Date.now(),
+            });
+          }
           break;
 
         case 'runtime-error':
-          addConsoleLog({
-            level: 'error',
-            message: `Runtime Error: ${data.payload.message}`,
-            timestamp: data.payload.timestamp || Date.now(),
-            filename: data.payload.filename,
-            lineno: data.payload.lineno,
-          });
+          if (data.payload && typeof data.payload === 'object') {
+            addConsoleLog({
+              level: 'error',
+              message: `Runtime Error: ${String(data.payload.message || '').slice(0, 500)}`,
+              timestamp: typeof data.payload.timestamp === 'number' ? data.payload.timestamp : Date.now(),
+              filename: typeof data.payload.filename === 'string' ? data.payload.filename.slice(0, 200) : undefined,
+              lineno: typeof data.payload.lineno === 'number' ? data.payload.lineno : undefined,
+            });
+          }
           break;
 
         default:
@@ -154,14 +182,17 @@ export const LivePreview: React.FC<LivePreviewProps> = ({
           </div>
         )}
 
-        {/* Sandboxed iframe */}
+        {/* Sandboxed iframe — NOTE: allow-same-origin is intentionally OMITTED.
+            Combining allow-scripts + allow-same-origin on the same origin allows
+            sandboxed JS to escape the iframe and access parent cookies/storage.
+            postMessage communication works fine without allow-same-origin. */}
         {previewUrl ? (
           <iframe
             id="codecanvas-preview-iframe"
             ref={iframeRef}
             src={previewUrl}
             title="CodeCanvas Live Preview"
-            sandbox="allow-scripts allow-modals allow-same-origin"
+            sandbox="allow-scripts allow-modals allow-forms"
             className="w-full h-full border-none bg-white"
             onLoad={() => setIsLoading(false)}
           />

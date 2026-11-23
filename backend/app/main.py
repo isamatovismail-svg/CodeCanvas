@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +20,13 @@ async def lifespan(app: FastAPI):
     await init_db()
     # Initialize Redis connection for WebSocket Pub/Sub if running
     await ws_manager.init_redis()
+    # Start Redis subscriber for multi-instance event relay (no-op if Redis is unavailable)
+    if ws_manager.redis_client:
+        ws_manager._pubsub_task = asyncio.create_task(ws_manager.start_redis_subscriber())
     yield
     # Shutdown
+    if ws_manager._pubsub_task and not ws_manager._pubsub_task.done():
+        ws_manager._pubsub_task.cancel()
     if ws_manager.redis_client:
         await ws_manager.redis_client.close()
 

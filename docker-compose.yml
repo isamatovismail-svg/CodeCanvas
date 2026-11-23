@@ -4,7 +4,7 @@ services:
     container_name: codecanvas_postgres
     environment:
       POSTGRES_USER: codecanvas
-      POSTGRES_PASSWORD: codecanvas_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
       POSTGRES_DB: codecanvas
     ports:
       - "5438:5432"
@@ -35,10 +35,11 @@ services:
       dockerfile: Dockerfile
     container_name: codecanvas_backend
     environment:
-      DATABASE_URL: postgresql+asyncpg://codecanvas:codecanvas_password@postgres:5432/codecanvas
+      DATABASE_URL: postgresql+asyncpg://codecanvas:${POSTGRES_PASSWORD}@postgres:5432/codecanvas
       REDIS_URL: redis://redis:6379/0
       PROJECT_NAME: CodeCanvas
-      SECRET_KEY: codecanvas_production_super_secret_jwt_key_2025
+      ENVIRONMENT: production
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set in .env}
     ports:
       - "8000:8000"
     volumes:

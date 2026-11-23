@@ -99,19 +99,32 @@ async def upload_asset(
 ):
     """
     Upload an image or asset file for image replacement in visual editor.
+    Enforces size limits and validates content before writing to disk.
     """
     await ProjectService.get_project_by_id(db, project_id, current_user.id)
-    clean_name = sanitize_filename(file.filename)
+    clean_name = os.path.basename(sanitize_filename(file.filename or "unnamed_asset"))
     validate_file_safety(clean_name)
 
-    proj_dir = os.path.join(settings.UPLOAD_DIR, project_id)
+    # Read content into memory first so we can enforce size limit BEFORE writing to disk
+    max_size = settings.MAX_UPLOAD_SIZE_BYTES
+    content = await file.read(max_size + 1)
+    if len(content) > max_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large. Maximum allowed size is {max_size // (1024 * 1024)} MB."
+        )
+
+    proj_dir = os.path.realpath(os.path.join(settings.UPLOAD_DIR, project_id))
     os.makedirs(proj_dir, exist_ok=True)
-    file_path = os.path.join(proj_dir, clean_name)
+    file_path = os.path.realpath(os.path.join(proj_dir, clean_name))
+
+    if not file_path.startswith(proj_dir + os.sep) and file_path != proj_dir:
+        raise HTTPException(status_code=400, detail="Invalid filename")
 
     with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+        buffer.write(content)
 
-    file_size = os.path.getsize(file_path)
+    file_size = len(content)
     url_path = f"/api/v1/projects/{project_id}/assets/{clean_name}"
 
     asset = ProjectAsset(
@@ -133,13 +146,28 @@ async def upload_asset(
     }
 
 
-@router.get("/assets/{filename}")
+@router.get("/assets/{filename:path}")
 async def get_project_asset(
     project_id: str,
-    filename: str
+    filename: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    clean_name = sanitize_filename(filename)
-    file_path = os.path.join(settings.UPLOAD_DIR, project_id, clean_name)
+    """
+    Serve a project asset file. Requires authentication and project access.
+    Accepts Bearer token in header or ?token= in query string.
+    Strictly verifies path containment to prevent directory traversal.
+    """
+    await ProjectService.get_project_by_id(db, project_id, current_user.id)
+    clean_name = os.path.basename(sanitize_filename(filename))
+    proj_dir = os.path.realpath(os.path.join(settings.UPLOAD_DIR, project_id))
+    file_path = os.path.realpath(os.path.join(proj_dir, clean_name))
+
+    # Path traversal guard: must be strictly inside the project upload directory
+    if not file_path.startswith(proj_dir + os.sep) and file_path != proj_dir:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     if not os.path.isfile(file_path):
         raise HTTPException(status_code=404, detail="Asset not found")
+
     return FastAPIFileResponse(file_path)

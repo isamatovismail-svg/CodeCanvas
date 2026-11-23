@@ -167,12 +167,22 @@ def inject_preview_bridge(html_content: str, project_id: str) -> str:
   const originalLog = console.log;
 
   function postMsg(type, payload) {{
+    // Use ancestorOrigins if available (supported in most browsers).
+    // Fall back to '*' only as a last resort — the bridge only sends
+    // non-sensitive editor events (element info, console logs) so this
+    // is acceptable when the parent origin cannot be determined.
+    var targetOrigin = "*";
+    try {{
+      if (window.location.ancestorOrigins && window.location.ancestorOrigins.length > 0) {{
+        targetOrigin = window.location.ancestorOrigins[0];
+      }}
+    }} catch(e) {{}}
     window.parent.postMessage({{
       source: "codecanvas-preview",
       projectId: PROJECT_ID,
       type: type,
       payload: payload
-    }}, "*");
+    }}, targetOrigin);
   }}
 
   console.error = function(...args) {{
@@ -302,8 +312,15 @@ def inject_preview_bridge(html_content: str, project_id: str) -> str:
 
   // Incoming Messages from Parent Window (Visual Editor Controls)
   window.addEventListener("message", function(event) {{
-    const data = event.data;
-    if (!data || data.target !== "codecanvas-preview") return;
+    // Security: strictly verify that the message is sent from the parent window.
+    if (event.source !== window.parent) return;
+
+    var data = event.data;
+    if (!data || typeof data !== "object") return;
+    if (data.target !== "codecanvas-preview") return;
+
+    var ALLOWED_COMMANDS = ["select-element-by-id", "update-element-style", "update-element-attribute", "update-element-text", "get-dom-tree"];
+    if (ALLOWED_COMMANDS.indexOf(data.type) === -1) return;
 
     if (data.type === "select-element-by-id") {{
       const el = document.querySelector(`[data-cc-id="${{data.elementId}}"]`) || document.getElementById(data.elementId);
