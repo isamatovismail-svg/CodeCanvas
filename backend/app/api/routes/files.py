@@ -6,7 +6,7 @@ from fastapi.responses import FileResponse as FastAPIFileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.connection import get_db
 from app.database.models import User, ProjectAsset
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_current_user_for_media_or_query
 from app.schemas.file import FileCreate, FileUpdate, FileResponse
 from app.schemas.websocket import ElementUpdatePayload
 from app.services.code_service import CodeService
@@ -151,7 +151,7 @@ async def get_project_asset(
     project_id: str,
     filename: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_for_media_or_query),
 ):
     """
     Serve a project asset file. Requires authentication and project access.

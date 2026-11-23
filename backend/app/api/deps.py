@@ -42,14 +42,50 @@ async def get_or_create_default_user(db: AsyncSession) -> User:
 
 async def get_current_user(
     auth: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> User:
+    """
+    Strict header-only authentication dependency for API endpoints.
+    Requires Bearer token in the Authorization header.
+    Query parameter ?token= is NOT accepted here, preventing query-string authentication on mutating API calls.
+    - In development mode: falls back to default dev user when NO Authorization header is provided.
+    - If Authorization header is provided with invalid/expired token: ALWAYS raises HTTP 401.
+    - In production/test mode: raises HTTP 401 if no valid Authorization header is supplied.
+    """
+    environment = (os.getenv("ENVIRONMENT") or settings.ENVIRONMENT or "development").lower()
+
+    if auth and auth.credentials:
+        payload = decode_access_token(auth.credentials)
+        if payload and "sub" in payload:
+            user_id = payload["sub"]
+            result = await db.execute(select(User).where(User.id == user_id))
+            user = result.scalar_one_or_none()
+            if user and user.is_active:
+                return user
+        # Token was present but invalid/expired — always reject
+        raise _CREDENTIALS_EXCEPTION
+
+    # No token provided
+    if environment == "development":
+        # Zero-friction local dev: use the default developer account
+        return await get_or_create_default_user(db)
+
+    # In production/test: require a real token
+    raise _CREDENTIALS_EXCEPTION
+
+
+async def get_current_user_for_media_or_query(
+    auth: Optional[HTTPAuthorizationCredentials] = Depends(security_scheme),
     token: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db)
 ) -> User:
     """
-    Strict authentication dependency.
-    Accepts Bearer token in Authorization header, or ?token= query parameter (for iframe/asset loading).
-    - In development mode: falls back to the default dev user when no token is provided.
-    - In production/test mode: raises HTTP 401 if no valid token is supplied.
+    Dedicated authentication dependency strictly for preview iframe and asset/media GET requests
+    where browsers cannot attach custom Authorization headers to navigation or <img> tags.
+    Accepts Bearer token in Authorization header OR ?token= query parameter.
+    - In development mode: falls back to default dev user when no token is provided.
+    - In production/test mode: raises HTTP 401 if neither valid header nor query token is supplied.
+    - Invalid tokens in header or query parameter ALWAYS raise HTTP 401.
     """
     raw_token = auth.credentials if (auth and auth.credentials) else token
     environment = (os.getenv("ENVIRONMENT") or settings.ENVIRONMENT or "development").lower()
@@ -67,10 +103,8 @@ async def get_current_user(
 
     # No token provided
     if environment == "development":
-        # Zero-friction local dev: use the default developer account
         return await get_or_create_default_user(db)
 
-    # In production/test: require a real token
     raise _CREDENTIALS_EXCEPTION
 
 

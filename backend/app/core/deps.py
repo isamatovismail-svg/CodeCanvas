@@ -8,6 +8,7 @@ from app.api.deps import (
     DEFAULT_USER_ID,
     get_or_create_default_user,
     get_current_user,
+    get_current_user_for_media_or_query,
     get_current_user_optional,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "DEFAULT_USER_ID",
     "get_or_create_default_user",
     "get_current_user",
+    "get_current_user_for_media_or_query",
     "get_current_user_optional",
 ]

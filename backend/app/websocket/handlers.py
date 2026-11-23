@@ -10,6 +10,7 @@ from app.services.code_service import CodeService
 from app.services.version_service import VersionService
 from app.services.project_service import ProjectService
 from app.core.security import decode_access_token
+from app.core.config import settings
 
 logger = logging.getLogger("codecanvas.websocket.handler")
 

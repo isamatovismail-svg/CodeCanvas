@@ -522,3 +522,117 @@ async def test_redis_deduplication_skips_same_instance():
     # The duplicate message must be skipped
     assert len(broadcast_calls) == 0, "Duplicate message from same instance was NOT skipped!"
 
+
+# ---------------------------------------------------------------------------
+# 19. Mutating endpoints reject ?token= query parameter (Header only)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_mutating_endpoints_reject_query_token(anon_client, db_session):
+    """
+    POST, PUT, DELETE must NEVER authenticate via ?token= query parameter.
+    They must require the Authorization: Bearer <token> header.
+    """
+    owner = await _make_user(db_session, "mutating@test.com", "uid-mut-19")
+    project = await _make_project(db_session, owner.id, "proj-mut-19")
+    token = _token(owner.id, owner.email)
+
+    with patch.dict("os.environ", {"ENVIRONMENT": "production"}):
+        # 1. POST /projects with query token only (NO Authorization header)
+        resp = await anon_client.post(f"/api/v1/projects?token={token}", json={"title": "Unauthorized"})
+        assert resp.status_code == 401, f"POST /projects accepted query token: {resp.status_code}"
+
+        # 2. PUT /projects/{id} with query token only
+        resp = await anon_client.put(f"/api/v1/projects/{project.id}?token={token}", json={"title": "Hacked"})
+        assert resp.status_code == 401, f"PUT /projects accepted query token: {resp.status_code}"
+
+        # 3. DELETE /projects/{id} with query token only
+        resp = await anon_client.delete(f"/api/v1/projects/{project.id}?token={token}")
+        assert resp.status_code == 401, f"DELETE /projects accepted query token: {resp.status_code}"
+
+        # 4. POST element-update with query token only
+        resp = await anon_client.post(
+            f"/api/v1/projects/{project.id}/element-update?token={token}",
+            json={"element_id": "p-1", "text_content": "Modified"}
+        )
+        assert resp.status_code == 401, f"POST element-update accepted query token: {resp.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# 20. WebSocket connection behavior across development, test, and production
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_websocket_across_environments(db_session):
+    """
+    Test real WebSocket connection handling in development, test, and production.
+    - development: accepts connection without token (dev fallback).
+    - production / test: rejects connection without token.
+    - production: accepts connection with valid token for authorized project.
+    """
+    from starlette.testclient import TestClient
+    from app.main import app
+
+    user = await _make_user(db_session, "wsenv@test.com", "uid-ws-env-20")
+    project = await _make_project(db_session, user.id, "proj-ws-env-20")
+    valid_token = _token(user.id, user.email)
+
+    client = TestClient(app)
+
+    # 1. Production: unauthenticated connection is rejected with error event + close code 4001
+    with patch.dict("os.environ", {"ENVIRONMENT": "production"}):
+        from starlette.websockets import WebSocketDisconnect
+        with client.websocket_connect(f"/ws/projects/{project.id}") as ws:
+            msg = ws.receive_json()
+            assert msg.get("event") == "error"
+            assert "Authentication required" in msg.get("data", {}).get("message", "")
+            # Connection is closed by server
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4001
+
+    # 2. Production: authenticated connection succeeds
+    with patch.dict("os.environ", {"ENVIRONMENT": "production"}):
+        with patch("app.websocket.handlers.AsyncSessionLocal", _SessionLocal):
+            with client.websocket_connect(f"/ws/projects/{project.id}?token={valid_token}") as ws:
+                msg = ws.receive_json()
+                assert msg.get("event") == "project.joined"
+                assert msg["data"]["currentUser"]["userId"] == user.id
+
+    # 3. Development: connection without token succeeds via dev fallback
+    with patch.dict("os.environ", {"ENVIRONMENT": "development"}):
+        with patch("app.websocket.handlers.AsyncSessionLocal", _SessionLocal):
+            # In dev mode, project must be accessible to default dev user
+            dev_user = await _make_user(db_session, "developer@codecanvas.io", "00000000-0000-0000-0000-000000000001")
+            dev_project = await _make_project(db_session, dev_user.id, "proj-ws-dev-20")
+            with client.websocket_connect(f"/ws/projects/{dev_project.id}") as ws:
+                msg = ws.receive_json()
+                assert msg.get("event") == "project.joined"
+
+
+# ---------------------------------------------------------------------------
+# 21. Config Pydantic settings validation without os.environ dependency
+# ---------------------------------------------------------------------------
+
+def test_config_settings_pydantic_direct_validation():
+    """
+    Verify that Settings(ENVIRONMENT='production') validates SECRET_KEY
+    directly from Pydantic fields, regardless of os.environ state.
+    """
+    from app.core.config import Settings, DEFAULT_DEV_SECRET
+
+    # Ensure os.environ is NOT set to production
+    with patch.dict("os.environ", {"ENVIRONMENT": "development"}, clear=True):
+        # Passing ENVIRONMENT="production" in kwargs must trigger validation error
+        with pytest.raises(ValueError, match="CRITICAL SECURITY CONFIGURATION ERROR"):
+            Settings(ENVIRONMENT="production", SECRET_KEY=DEFAULT_DEV_SECRET)
+
+        with pytest.raises(ValueError, match="CRITICAL SECURITY CONFIGURATION ERROR"):
+            Settings(ENVIRONMENT="production", SECRET_KEY="short-key")
+
+        # Strong key must succeed
+        s = Settings(ENVIRONMENT="production", SECRET_KEY="a" * 32)
+        assert s.ENVIRONMENT == "production"
+        assert s.SECRET_KEY == "a" * 32
+
+

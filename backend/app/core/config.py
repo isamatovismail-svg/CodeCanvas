@@ -1,7 +1,7 @@
 import os
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import field_validator
+from pydantic import model_validator
 
 DEFAULT_DEV_SECRET = "codecanvas-insecure-development-secret-key-replace-in-prod-xyz-2025"
 
@@ -41,17 +41,15 @@ class Settings(BaseSettings):
         extra="ignore"
     )
 
-    @field_validator("SECRET_KEY")
-    @classmethod
-    def validate_secret_key(cls, v: str, info) -> str:
-        env = os.getenv("ENVIRONMENT", "development").lower()
-        if env == "production":
-            if v == DEFAULT_DEV_SECRET or len(v) < 32:
+    @model_validator(mode="after")
+    def validate_production_settings(self) -> "Settings":
+        if self.ENVIRONMENT.lower() == "production":
+            if self.SECRET_KEY == DEFAULT_DEV_SECRET or len(self.SECRET_KEY) < 32:
                 raise ValueError(
                     "CRITICAL SECURITY CONFIGURATION ERROR: In production mode, "
                     "a secure non-default SECRET_KEY with at least 32 characters must be provided."
                 )
-        return v
+        return self
 
 
 settings = Settings()

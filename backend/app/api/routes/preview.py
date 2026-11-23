@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database.connection import get_db
 from app.database.models import User
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user_for_media_or_query
 from app.services.preview_service import PreviewService
 from app.services.project_service import ProjectService
 
@@ -13,7 +13,7 @@ router = APIRouter(prefix="/projects/{project_id}", tags=["Live Preview"])
 async def get_preview(
     project_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_for_media_or_query),
 ):
     """
     Renders the live sandboxed website preview document.
