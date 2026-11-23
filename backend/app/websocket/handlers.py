@@ -39,6 +39,8 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
     user_id = None
     user_name = "Developer"
     user_email = ""
+    # Track whether a token was explicitly provided (even if it is invalid/expired)
+    token_was_provided = bool(token)
 
     if token:
         payload = decode_access_token(token)
@@ -46,15 +48,18 @@ async def handle_websocket_connection(websocket: WebSocket, project_id: str, tok
             user_id = payload["sub"]
             user_email = payload.get("email", "")
             user_name = user_email.split("@")[0].capitalize() if user_email else "Developer"
+        # else: token was provided but is invalid/expired — user_id stays None,
+        # token_was_provided=True → must be rejected even in development mode.
 
-    # If no token resolved a user, check if we can use the dev fallback
     if not user_id:
-        if environment == "development":
-            # Use default developer identity in local dev mode
+        if not token_was_provided and environment == "development":
+            # Only apply dev fallback when NO token was supplied at all.
             user_id = "00000000-0000-0000-0000-000000000001"
             user_name = "Developer"
         else:
-            # Reject unauthenticated connections in production/test
+            # Reject in every other case:
+            #   - invalid/expired token (any environment, including development)
+            #   - no token in production or test environment
             await websocket.accept()
             await websocket.send_json({
                 "event": WSEvent.ERROR,

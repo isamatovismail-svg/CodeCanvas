@@ -614,6 +614,79 @@ async def test_websocket_across_environments(db_session):
 # 21. Config Pydantic settings validation without os.environ dependency
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 22. WebSocket: invalid token in development mode → rejected with 4001
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ws_dev_mode_invalid_token_rejected(db_session):
+    """
+    In ENVIRONMENT=development, supplying an invalid/expired token must still
+    return close code 4001 — the dev fallback must NOT apply when a token was
+    explicitly provided but is not decodable.
+    """
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+    from app.main import app
+
+    u = await _make_user(db_session, "devbadtok@test.com", "uid-dev-badtok-22")
+    p = await _make_project(db_session, u.id, "proj-dev-badtok-22")
+
+    client = TestClient(app)
+
+    with patch.dict("os.environ", {"ENVIRONMENT": "development"}):
+        with client.websocket_connect(
+            f"/ws/projects/{p.id}?token=this.is.not.a.valid.token"
+        ) as ws:
+            msg = ws.receive_json()
+            # Must get an error event
+            assert msg.get("event") == "error", (
+                f"Expected error event in dev mode with invalid token, got: {msg}"
+            )
+            assert "Authentication required" in msg.get("data", {}).get("message", ""), (
+                f"Unexpected error message: {msg}"
+            )
+            # Must be closed with 4001
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+            assert exc_info.value.code == 4001, (
+                f"Expected WS close code 4001, got: {exc_info.value.code}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# 23. WebSocket: no token in development mode → dev fallback works
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ws_dev_mode_no_token_uses_fallback(db_session):
+    """
+    In ENVIRONMENT=development, connecting WITHOUT any token must trigger the
+    dev fallback (default user) and the connection must be accepted.
+    """
+    from starlette.testclient import TestClient
+    from app.main import app
+
+    # The dev fallback user must exist in the database
+    dev_user = await _make_user(
+        db_session,
+        "developer@codecanvas.io",
+        "00000000-0000-0000-0000-000000000001",
+    )
+    dev_project = await _make_project(db_session, dev_user.id, "proj-ws-dev-fallback-23")
+
+    client = TestClient(app)
+
+    with patch.dict("os.environ", {"ENVIRONMENT": "development"}):
+        with patch("app.websocket.handlers.AsyncSessionLocal", _SessionLocal):
+            with client.websocket_connect(
+                f"/ws/projects/{dev_project.id}"   # no ?token= at all
+            ) as ws:
+                msg = ws.receive_json()
+                assert msg.get("event") == "project.joined", (
+                    f"Expected project.joined for dev fallback, got: {msg}"
+                )
+
 def test_config_settings_pydantic_direct_validation():
     """
     Verify that Settings(ENVIRONMENT='production') validates SECRET_KEY
